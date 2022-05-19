@@ -24,6 +24,7 @@ import akka.stream.stage.{ GraphStageLogic, GraphStageWithMaterializedValue, InH
 import akka.util.ByteString
 import akka.stream.testkit.scaladsl.TestSink
 import akka.testkit._
+import org.scalatest.Inside.inside
 
 import scala.util.{ Failure, Success }
 
@@ -229,6 +230,33 @@ class WebSocketIntegrationSpec extends AkkaSpecWithMaterializer(
       binding.unbind()
     }
 
+    "Custom close code and close reasons are returned when a UserRequestedCloseFrameException occurs while processing messages on the server" in Utils.assertAllStagesStopped {
+      val handlerTermination = Promise[Done]()
+
+      val handler = Flow[Message]
+        .watchTermination()(Keep.right)
+        .mapMaterializedValue(handlerTermination.completeWith)
+        .map(_ => throw UserRequestedCloseFrameException(Protocol.CloseCodes.Unacceptable, "unacceptable"))
+
+      val bindingFuture = Http().newServerAt("localhost", 0).bindSync(_.attribute(webSocketUpgrade).get.handleMessages(handler, None))
+      val binding = Await.result(bindingFuture, 3.seconds.dilated)
+      val myPort = binding.localAddress.getPort
+
+      inside(
+        Source.single(TextMessage("Test"))
+          .via(Http().webSocketClientFlow(WebSocketRequest("ws://localhost:" + myPort)))
+        .runWith(Sink.seq)
+        .failed.futureValue) {
+        case ex: PeerClosedConnectionException =>
+          ex.closeCode shouldBe Protocol.CloseCodes.Unacceptable
+          ex.closeReason shouldBe "unacceptable"
+      }
+
+      // Should fail, not complete:
+      handlerTermination.future.futureValue
+
+      binding.unbind()
+    }
   }
 
   "A websocket client" should {
